@@ -1,0 +1,50 @@
+# CIFAR-100 small baseline — 100% M3, 3-tier nested vision
+# 192d, 6h, 2+2+2 tiers, patch=4
+
+model:
+  num_classes: 100
+  d_model:     192
+  num_heads:   6
+  chunk_size:  16
+  ff_expansion: 4
+  num_slow:    2
+  num_mid:     2
+  num_fast:    2
+  patch_size:  4
+  img_size:    32
+  embed_type:  flat
+
+train:
+  epochs:      200
+  batch:       256
+  lr:          1.0e-3
+  mid_period:  16
+  slow_period: 256
+  ewc_lambda:  0.0     # set to 0.1 for continual learning
+
+data:
+  data_dir:    ./data
+  num_workers: 4
+
+optimizer:
+  # All three tiers use M3 (Newton-Schulz)
+  fast:
+    lr:         1.0e-3
+    ns_steps:   3
+    slow_chunk: 100
+    beta1:      0.9
+    beta2:      0.999
+    beta3:      0.9
+    alpha:      1.0
+  mid:
+    lr:         5.0e-4
+    ns_steps:   3
+    slow_chunk: 100
+  slow:
+    lr:         1.0e-4
+    ns_steps:   5     # higher quality for rare updates
+    slow_chunk: 200
+    warmup_steps: 100
+
+checkpoint:
+  dir:   ./checkpoints
