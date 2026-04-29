@@ -2,6 +2,9 @@
 
 **3-Tier Nested Learning Vision Model — 100% M3 Optimizer**
 
+> See [`docs/`](docs/README.md) for the audit report, changelog, testing
+> guide, and the catastrophic-forgetting benchmark methodology.
+
 Adapted from `nested_learning` (LLM) and `vit_m3_project` (single-tier ViT).  
 This project brings the full **Slow / Mid / Fast** nested hierarchy to computer vision,
 with no AdamW, no SGD, no hybrid — pure Newton-Schulz gradient orthogonalization.
@@ -72,6 +75,9 @@ nested_learning_vision/
 # Smoke test (no dataset needed)
 python smoke_test.py
 
+# Unit tests
+python -m pytest tests/ -q
+
 # Train on CIFAR-100 (auto-downloads)
 python train_cifar100.py
 
@@ -88,6 +94,10 @@ python train_cifar100.py \
 
 # Resume from checkpoint
 python train_cifar100.py --resume checkpoints/best.pt
+
+# Catastrophic-forgetting benchmark (4 ablations × 2 task pairs)
+python cf_benchmark.py --task split_cifar10   --variant all --epochs-a 5 --epochs-b 5
+python cf_benchmark.py --task cifar10_to_svhn --variant all --epochs-a 5 --epochs-b 5
 ```
 
 ---

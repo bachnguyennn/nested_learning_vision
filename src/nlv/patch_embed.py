@@ -50,9 +50,8 @@ class FlatPatchEmbed(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns [B, N, d_model] where N = (H/P)*(W/P)."""
-        x = self.proj(x)           # [B, D, H/P, W/P]
-        B, D, h, w = x.shape
-        return x.flatten(2).transpose(1, 2)   # [B, N, D]
+        x = self.proj(x)                       # [B, D, H/P, W/P]
+        return x.flatten(2).transpose(1, 2)    # [B, N, D]
 
 
 class ConvStemEmbed(nn.Module):
@@ -84,7 +83,6 @@ class ConvStemEmbed(nn.Module):
         self.proj = nn.Conv2d(mid, d_model, remaining_stride, stride=remaining_stride, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)     # [B, mid, H/4, W/4]
-        x = self.proj(x)     # [B, D,   H/P, W/P]
-        B, D, h, w = x.shape
-        return x.flatten(2).transpose(1, 2)   # [B, N, D]
+        x = self.stem(x)                       # [B, mid, H/4, W/4]
+        x = self.proj(x)                       # [B, D,   H/P, W/P]
+        return x.flatten(2).transpose(1, 2)    # [B, N, D]

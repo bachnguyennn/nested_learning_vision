@@ -63,6 +63,13 @@ class VisionModelConfig:
     img_size:      int   = 32
     embed_type:    str   = "flat"    # "flat" | "stem"
 
+    # Memory semantics
+    # If True (default for vision), the recurrent fast-weight memory inside
+    # each HOPEBlock is reset at the start of every forward — appropriate for
+    # i.i.d. classification where each image is independent.  Set False when
+    # using the model on a continuous stream / TBPTT style training.
+    reset_memory_per_forward: bool = True
+
     # Gradient checkpointing (saves memory at cost of re-compute)
     gradient_checkpointing: bool = False
 
@@ -155,8 +162,11 @@ class NestedVisionModel(nn.Module):
         # 3. Add positional embeddings (including learned CLS position)
         x = x + self.pos_embed                 # [B, N+1, D]
 
-        # 4. Reset fast-weight memories (each image is independent)
-        self.reset_memory()
+        # 4. Reset fast-weight memories — gated by config (default True for
+        # i.i.d. image classification; set False to keep recurrent state
+        # across forward calls, e.g. for streaming / TBPTT).
+        if self.config.reset_memory_per_forward:
+            self.reset_memory()
 
         # 5. Slow tier — global structure
         for layer in self.slow_layers:
@@ -176,18 +186,7 @@ class NestedVisionModel(nn.Module):
         # 9. Classification
         return self.head(cls_out)              # [B, num_classes]
 
-    # ── Tier parameter helpers (used by TieredOptimizerManager) ──────────
-
-    def slow_parameters(self):
-        return self.slow_layers.parameters()
-
-    def mid_parameters(self):
-        return self.mid_layers.parameters()
-
-    def fast_parameters(self):
-        """Fast tier + input/output layers (updated every step)."""
-        for p in self.fast_layers.parameters():
-            yield p
-        yield self.pos_embed
-        yield from self.patch_embed.parameters()
-        yield from self.head.parameters()
+    # NOTE: tier→parameter routing is owned by `TieredOptimizerManager._get_tier_params`
+    # so we deliberately do **not** expose `slow_parameters / mid_parameters /
+    # fast_parameters` helpers on the model. Keeping a single source of truth
+    # avoids drift between the model and the optimizer manager.

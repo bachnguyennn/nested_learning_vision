@@ -61,12 +61,23 @@ class TieredOptimizerManager:
         ]
         self.clock = LevelClock(specs)
 
-        # Build one M3 per tier, each wrapping the correct parameter group
+        # Build one M3 per tier, each wrapping the correct parameter group.
+        # Cross-tier overlap is forbidden: a parameter must belong to exactly
+        # ONE optimizer to avoid double-stepping.
         self.optimizers: Dict[str, M3] = {}
+        global_seen: Dict[int, str] = {}
         for t in tier_configs:
             params = self._get_tier_params(t.name)
             if not params:
                 raise ValueError(f"Tier '{t.name}' has no parameters in the model.")
+            for p in params:
+                if id(p) in global_seen:
+                    raise ValueError(
+                        f"Parameter id={id(p)} is routed to both tiers "
+                        f"'{global_seen[id(p)]}' and '{t.name}'. "
+                        "Each parameter must belong to exactly one tier."
+                    )
+                global_seen[id(p)] = t.name
             self.optimizers[t.name] = M3(
                 params,
                 lr=t.lr,

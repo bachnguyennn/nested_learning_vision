@@ -82,38 +82,78 @@ def parse_args() -> argparse.Namespace:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EWC:
-    """Lightweight EWC penalty on a set of parameters.
+    """Classical Kirkpatrick-style EWC penalty for the slow tier.
 
-    After calling .snapshot(), the Fisher information is estimated from the
-    current gradient and the penalty is ||θ - θ*||²_F (diagonal Fisher).
+    Fisher diagonal is estimated by averaging squared gradients across
+    `n_batches` minibatches drawn from the previous task's data, **once**,
+    after that task is finished. The anchor is the weight snapshot at that
+    moment. Penalty: lambda * sum_i F_i * (theta_i - theta_i*)^2.
     """
+
     def __init__(self, model: NestedVisionModel, lam: float) -> None:
         self.model = model
-        self.lam   = lam
+        self.lam = lam
         self._anchors: dict[str, torch.Tensor] = {}
         self._fishers: dict[str, torch.Tensor] = {}
 
-    def snapshot(self) -> None:
-        """Save current slow-tier weights and their Fisher diagonal."""
-        self._anchors.clear()
-        self._fishers.clear()
-        for name, p in self.model.slow_layers.named_parameters():
-            self._anchors[name] = p.data.clone()
+    @torch.no_grad()
+    def _zero_grads_slow(self) -> None:
+        for p in self.model.slow_layers.parameters():
             if p.grad is not None:
-                self._fishers[name] = p.grad.data.pow(2).clone()
-            else:
-                self._fishers[name] = torch.ones_like(p.data)
+                p.grad.zero_()
+
+    def snapshot(
+        self,
+        loader: DataLoader,
+        device: torch.device,
+        criterion: nn.Module,
+        n_batches: int = 40,
+    ) -> None:
+        """Estimate Fisher diagonal over `n_batches` of `loader`, then anchor."""
+        self._anchors = {
+            name: p.data.detach().clone()
+            for name, p in self.model.slow_layers.named_parameters()
+        }
+        fishers = {
+            name: torch.zeros_like(p.data)
+            for name, p in self.model.slow_layers.named_parameters()
+        }
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            seen = 0
+            for i, (images, labels) in enumerate(loader):
+                if i >= n_batches:
+                    break
+                images, labels = images.to(device), labels.to(device)
+                self._zero_grads_slow()
+                logits = self.model(images)
+                loss = criterion(logits, labels)
+                loss.backward()
+                for name, p in self.model.slow_layers.named_parameters():
+                    if p.grad is not None:
+                        fishers[name] += p.grad.detach().pow(2)
+                seen += 1
+            denom = max(seen, 1)
+            self._fishers = {name: f / denom for name, f in fishers.items()}
+        finally:
+            self._zero_grads_slow()
+            if was_training:
+                self.model.train()
 
     def penalty(self) -> torch.Tensor:
-        """Return scalar EWC penalty (call before optimizer.step)."""
         if not self._anchors:
-            return torch.tensor(0.0)
-        loss = torch.tensor(0.0, device=next(self.model.parameters()).device)
+            return torch.tensor(0.0, device=next(self.model.parameters()).device)
+        device = next(self.model.parameters()).device
+        loss = torch.tensor(0.0, device=device)
         for name, p in self.model.slow_layers.named_parameters():
-            if name in self._anchors:
-                f   = self._fishers.get(name, torch.ones_like(p))
-                diff = p - self._anchors[name].to(p.device)
-                loss = loss + (f.to(p.device) * diff.pow(2)).sum()
+            if name not in self._anchors:
+                continue
+            f = self._fishers.get(name)
+            if f is None:
+                continue
+            diff = p - self._anchors[name].to(p.device)
+            loss = loss + (f.to(p.device) * diff.pow(2)).sum()
         return self.lam * loss
 
 
@@ -144,9 +184,10 @@ def evaluate(model: NestedVisionModel, loader: DataLoader,
     model.eval()
     loss_m, top1_m, top5_m = AverageMeter(), AverageMeter(), AverageMeter()
     use_amp = (device.type == "cuda")
+    amp_dtype = torch.bfloat16
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             logits = model(images)
             loss   = criterion(logits, labels)
         top1, top5 = topk_accuracy(logits.float(), labels, topk=(1, 5))
@@ -242,12 +283,18 @@ def main() -> None:
     mgr = TieredOptimizerManager(model, tier_configs)
 
     # ── EWC (optional, slow tier protection) ─────────────────────────────
+    # NOTE: classical EWC requires an explicit anchor moment. For single-task
+    # CIFAR-100 training we initialize the regularizer but **do not call
+    # snapshot** here — anchoring happens externally (e.g. between two tasks
+    # in the continual-learning script). With no anchor, ewc.penalty() == 0.
     ewc = EWC(model, lam=args.ewc_lambda) if args.ewc_lambda > 0 else None
 
     # ── Criterion + AMP ───────────────────────────────────────────────────
+    # We train under bfloat16 autocast on CUDA. bf16 has no underflow risk that
+    # GradScaler is designed for, so we deliberately do NOT use GradScaler here.
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     use_amp   = (device.type == "cuda")
-    scaler    = torch.amp.GradScaler("cuda", enabled=use_amp)
+    amp_dtype = torch.bfloat16
 
     # ── LR scheduler (cosine, attached to fast optimizer) ─────────────────
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -281,43 +328,34 @@ def main() -> None:
             images, labels = images.to(device), labels.to(device)
 
             # Forward
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 logits = model(images)
                 loss   = criterion(logits, labels)
-                # Add EWC penalty if enabled
+                # Add EWC penalty if enabled (anchor is set externally via ewc.snapshot)
                 if ewc is not None:
                     loss = loss + ewc.penalty()
 
-            # Backward
-            scaler.scale(loss).backward()
-            scaler.unscale_(mgr.optimizers["fast"])
+            # Backward (bf16 autocast → no GradScaler needed)
+            loss.backward()
 
             # Clip globally
             all_params = [p for p in model.parameters() if p.grad is not None]
             grad_norm  = torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
 
-            if not torch.isnan(grad_norm):
+            ran: dict[str, bool] = {}
+            if torch.isfinite(grad_norm):
                 # ── Step all tiers due this step ──────────────────────────
-                # (M3 reads .grad directly via optimizer.step())
-                # We manually handle tier stepping since TieredOptimizerManager
-                # uses its own grad reading — call scaler.step per optimizer.
-                ran = {}
                 for tier_name, opt in mgr.optimizers.items():
                     if mgr.clock.should_update(tier_name):
-                        scaler.step(opt)
+                        opt.step()
                         mgr.clock.record_update(tier_name)
                         ran[tier_name] = True
             else:
-                print(f"  [WARN] ep{epoch+1} step{global_step}: NaN grad — skip")
+                print(f"  [WARN] ep{epoch+1} step{global_step}: non-finite grad — skip")
 
-            scaler.update()
             mgr.zero_grad()
             mgr.tick()
             global_step += 1
-
-            # EWC snapshot on slow update
-            if ewc is not None and ran.get("slow"):
-                ewc.snapshot()
 
             # Metrics
             top1, _ = topk_accuracy(logits.float().detach(), labels)
