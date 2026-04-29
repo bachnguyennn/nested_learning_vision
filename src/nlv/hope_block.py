@@ -171,7 +171,7 @@ class ChunkedGatedDeltaNode(nn.Module):
             output_h = torch.einsum("bhij,bhcj->bhci", M, q_h)   # [B, H, C, Dh]
             outputs.append(output_h.permute(0, 2, 1, 3))           # [B, C, H, Dh]
 
-        self._memory_state = M
+        self._memory_state = M.detach()   # detach: never carry graph into next batch
         return torch.cat(outputs, dim=1)[:, :seq_len], M
 
 
